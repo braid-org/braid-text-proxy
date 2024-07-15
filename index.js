@@ -1,19 +1,34 @@
 
-const http = require('http');
-const https = require('https');
-const url = require('url');
+let http = require('http');
 
-let {diff_main} = require('./diff.js')
+let { diff_main } = require('./diff.js')
+let braid_text = require("braid-text");
+let braid_fetch = require('braid-http').fetch
 
-var braid_text = require("braid-text")
+let port = 10000
+let cookie = null
+let pin_urls = []
+let pindex_urls = []
+let proxy_base = `./proxy_base`
 
-var braid_fetch = require('braid-http').fetch
-
-var known_urls = {}
-
-const port = process.argv[2] || 10000;
-const cookie = process.argv[3] || null;
-console.log(`cookie = ${cookie}`)
+let argv = process.argv.slice(2)
+while (argv.length) {
+    let a = argv.shift()
+    if (a.match(/^\d+$/)) {
+        port = parseInt(a)
+    } else if (a === '-pin') {
+        let b = argv.shift()
+        if (b === 'index') {
+            pindex_urls.push(argv.shift())
+        } else {
+            pin_urls.push(b)
+        }
+    } else {
+        cookie = a
+        console.log(`cookie = ${cookie}`)
+    }
+}
+console.log({ pin_urls, pindex_urls })
 
 process.on("unhandledRejection", (x) => console.log(`unhandledRejection: ${x.stack}`))
 process.on("uncaughtException", (x) => console.log(`uncaughtException: ${x.stack}`))
@@ -51,166 +66,12 @@ const server = http.createServer(async (req, res) => {
         return
     }
 
-    if (req.url.startsWith('/file-proxy/')) {
-        let rest = req.url.slice('/file-proxy/'.length)
-        let [target_url, fullpath] = rest.split('?')
-        console.log(`file proxy args: ${JSON.stringify({ target_url, fullpath })}`)
+    let url = req.url.slice(1)
 
-        let last_text = ''
-
-        let simpleton = simpleton_client(target_url, {
-            apply_remote_update: async ({ state, patches }) => {
-                if (state !== undefined) last_text = state;
-                else last_text = apply_patches(last_text, patches);
-
-                console.log(`last_text = ${last_text}, ${fullpath}`)
-
-                await require('fs').promises.writeFile(fullpath, last_text)
-
-                return last_text;
-            },
-            generate_local_diff_update: async (prev_state) => {
-                last_text = await require('fs').promises.readFile(fullpath, { encoding: 'utf8' })
-
-                console.log('HI: ' + JSON.stringify({prev_state, last_text}, null, 4))
-
-                var patches = diff(prev_state, last_text);
-
-                console.log('patches: ' + JSON.stringify({patches}, null, 4))
-
-                if (patches.length === 0) return null;
-                return { patches, new_state: last_text };
-            }
-        })
-
-        function diff(before, after) {
-            let diff = diff_main(before, after);
-            let patches = [];
-            let offset = 0;
-            for (let d of diff) {
-                let p = null;
-                if (d[0] == 1) p = { range: [offset, offset], content: d[1] };
-                else if (d[0] == -1) {
-                    p = { range: [offset, offset + d[1].length], content: "" };
-                    offset += d[1].length;
-                } else offset += d[1].length;
-                if (p) {
-                    p.unit = "text";
-                    patches.push(p);
-                }
-            }
-            return patches;
-        }
-        function watchFile(fullpath, callback) {
-            const fs = require('fs');
-            const path = require('path');
-            const directory = path.dirname(fullpath);
-            const filename = path.basename(fullpath);
-            fs.watch(directory, (eventType, changedFilename) => {
-                console.log(`file change!: ${eventType} : ${changedFilename}`)
-                if (eventType === 'change' && changedFilename === filename) {
-                    callback();
-                }
-            });
-            console.log(`Watching for changes to ${fullpath}`);
-        }
-        watchFile(fullpath, () => simpleton.changed());
-
-        res.writeHead(200, {})
-        res.end(JSON.stringify({ yoo: true, target_url, fullpath }))
-
-        return
-    }
-
-    // Create some initial text for new documents
-    // if (await braid_text.get(req.url) === undefined) {
-    //     console.log('----!')
-    //     await braid_text.put(req.url, { body: 'This is a fresh blank document, ready for you to edit.' })
-    // }
-
-    if (!known_urls[req.url]) {
-        known_urls[req.url] = true
-
-        let target_url = req.url.slice(1)
-        let peer = Math.random().toString(36).substr(2)
-        let current_version = []
-
-        braid_fetch_wrapper(target_url, {
-            headers: {
-                "Merge-Type": "dt",
-                Accept: 'text/plain'
-            },
-            subscribe: true,
-            retry: true,
-            parents: () => current_version.length ? current_version : null,
-            peer
-        }).then(x => {
-            x.subscribe(update => {
-                console.log(`update: ${JSON.stringify(update, null, 4)}`)
-                if (update.version.length == 0) return;
-
-                braid_text.put(req.url, { ...update, peer })
-            })
-        })
-
-        braid_text.get(req.url, {
-            subscribe: async ({ version, parents, body, patches }) => {
-                if (version.length == 0) return;
-
-                console.log(`local got: ${JSON.stringify({ version, parents, body, patches }, null, 4)}`)
-
-                await braid_fetch_wrapper(target_url, {
-                    headers: {
-                        "Merge-Type": "dt",
-                        "Content-Type": 'text/plain',
-                        ...(cookie ? { "Cookie": cookie } : {}),
-                    },
-                    method: "PUT",
-                    retry: true,
-                    version, parents, body, patches,
-                    peer
-                })
-            },
-            merge_type: 'dt',
-            peer
-        })
-    }
+    proxy_url(url)
 
     // Now serve the collaborative text!
-    braid_text.serve(req, res)
-
-    // // Extract the target URL from the request
-    // const targetUrl = req.url.slice(1); // Remove the leading '/'
-    // if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-    //     res.writeHead(400, { 'Content-Type': 'text/plain' });
-    //     res.end('Invalid URL. Please use format: /http://example.com or /https://example.com');
-    //     return;
-    // }
-
-    // const parsedUrl = url.parse(targetUrl);
-    // const options = {
-    //     hostname: parsedUrl.hostname,
-    //     port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
-    //     path: parsedUrl.path,
-    //     method: req.method,
-    //     headers: req.headers
-    // };
-
-    // // Remove the host header to avoid conflicts
-    // delete options.headers.host;
-
-    // const proxyReq = (parsedUrl.protocol === 'https:' ? https : http).request(options, (proxyRes) => {
-    //     res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    //     proxyRes.pipe(res);
-    // });
-
-    // proxyReq.on('error', (error) => {
-    //     console.error('Proxy error:', error);
-    //     res.writeHead(500, { 'Content-Type': 'text/plain' });
-    //     res.end('Proxy error');
-    // });
-
-    // req.pipe(proxyReq);
+    braid_text.serve(req, res, { key: url })
 });
 
 server.listen(port, () => {
@@ -218,7 +79,128 @@ server.listen(port, () => {
     console.log('This proxy is only accessible from localhost');
 });
 
-// Free the CORS!
+for (let url of pin_urls) proxy_url(url)
+pindex_urls.forEach(async url => {
+    let prefix = new URL(url).origin
+    while (true) {
+        let urls = await (await fetch(url)).json()
+        for (let url of urls) {
+            proxy_url(prefix + url)
+        }
+        await new Promise(done => setTimeout(done, 1000 * 60 * 60))
+    }
+})
+
+////////////////////////////////
+
+async function proxy_url(url) {
+    if (!proxy_url.cache) proxy_url.cache = {}
+    if (proxy_url.cache[url]) return
+    proxy_url.cache[url] = true
+
+    console.log(`proxy_url: ${url}`)
+
+    let peer = Math.random().toString(36).slice(2)
+    let current_version = []
+
+    braid_fetch_wrapper(url, {
+        headers: {
+            "Merge-Type": "dt",
+            Accept: 'text/plain'
+        },
+        subscribe: true,
+        retry: true,
+        parents: () => current_version.length ? current_version : null,
+        peer
+    }).then(x => {
+        x.subscribe(update => {
+            console.log(`update: ${JSON.stringify(update, null, 4)}`)
+            if (update.version.length == 0) return;
+
+            braid_text.put(url, { ...update, peer })
+        })
+    })
+
+    braid_text.get(url, {
+        subscribe: async ({ version, parents, body, patches }) => {
+            if (version.length == 0) return;
+
+            console.log(`local got: ${JSON.stringify({ version, parents, body, patches }, null, 4)}`)
+
+            await braid_fetch_wrapper(url, {
+                headers: {
+                    "Merge-Type": "dt",
+                    "Content-Type": 'text/plain',
+                    ...(cookie ? { "Cookie": cookie } : {}),
+                },
+                method: "PUT",
+                retry: true,
+                version, parents, body, patches,
+                peer
+            })
+        },
+        merge_type: 'dt',
+        peer
+    })
+
+    let last_text = ''
+    let path = url.replace(/^https?:\/\//, '')
+
+    let fullpath = proxy_base + '/' + path
+    await require('fs').promises.mkdir(require('path').dirname(fullpath), { recursive: true })
+
+    let simpleton = simpleton_client(url, {
+        apply_remote_update: async ({ state, patches }) => {
+
+            console.log(`writing file ${fullpath}`)
+
+            if (state !== undefined) last_text = state
+            else last_text = apply_patches(last_text, patches)
+            await require('fs').promises.writeFile(fullpath, last_text)
+            return last_text
+        },
+        generate_local_diff_update: async (_) => {
+            let text = await require('fs').promises.readFile(fullpath, { encoding: 'utf8' })
+            var patches = diff(last_text, text)
+            last_text = text
+            return patches.length ? { patches, new_state: last_text } : null
+        }
+    })
+
+    if (!proxy_url.path_to_func) proxy_url.path_to_func = {}
+    proxy_url.path_to_func[path] = () => {
+        simpleton.changed()
+    }
+
+    if (!proxy_url.chokidar) {
+        proxy_url.chokidar = true
+        require('chokidar').watch(proxy_base).on('change', (path) => {
+            path = require('path').relative(proxy_base, path)
+            console.log(`path changed: ${path}`)
+            proxy_url.path_to_func[path]()
+        });
+    }
+}
+
+function diff(before, after) {
+    let diff = diff_main(before, after);
+    let patches = [];
+    let offset = 0;
+    for (let d of diff) {
+        let p = null;
+        if (d[0] == 1) p = { range: [offset, offset], content: d[1] };
+        else if (d[0] == -1) {
+            p = { range: [offset, offset + d[1].length], content: "" };
+            offset += d[1].length;
+        } else offset += d[1].length;
+        if (p) {
+            p.unit = "text";
+            patches.push(p);
+        }
+    }
+    return patches;
+}
+
 function free_the_cors(req, res) {
     res.setHeader('Range-Request-Allow-Methods', 'PATCH, PUT');
     res.setHeader('Range-Request-Allow-Units', 'json');
@@ -232,46 +214,6 @@ function free_the_cors(req, res) {
     if (req.method === 'OPTIONS') {
         res.writeHead(200);
         res.end();
-    }
-}
-
-async function braid_fetch_wrapper(url, params) {
-    if (!params.retry) throw "wtf"
-    var waitTime = 10
-    if (params.subscribe) {
-        var subscribe_handler = null
-        connect()
-        async function connect() {
-            if (params.signal?.aborted) return
-            try {
-                console.log('URL: ' + url)
-                var c = await braid_fetch(url, { ...params, parents: params.parents?.() })
-                c.subscribe((...args) => subscribe_handler?.(...args), on_error)
-                waitTime = 10
-            } catch (e) {
-                on_error(e)
-            }
-        }
-        function on_error(e) {
-            console.log('eee = ' + e.stack)
-            setTimeout(connect, waitTime)
-            waitTime = Math.min(waitTime * 2, 3000)
-        }
-        return { subscribe: handler => { subscribe_handler = handler } }
-    } else {
-        return new Promise((done) => {
-            send()
-            async function send() {
-                try {
-                    var res = await braid_fetch(url, params)
-                    if (res.status !== 200) throw "status not 200: " + res.status
-                    done(res)
-                } catch (e) {
-                    setTimeout(send, waitTime)
-                    waitTime = Math.min(waitTime * 2, 3000)
-                }
-            }
-        })
     }
 }
 
@@ -297,49 +239,17 @@ function apply_patches(originalString, patches) {
     return result;
 }
 
-// requires braid-http@0.3.14
-// 
-// url: resource endpoint
-//
-// apply_remote_update: ({patches, state}) => {...}
-//     this is for incoming changes;
-//     one of these will be non-null,
-//     and can be applied to the current state.
-//
-// generate_local_diff_update: (prev_state) => {...}
-//     this is to generate outgoing changes,
-//     and if there are changes, returns { patches, new_state }
-//
-// content_type: used for Accept and Content-Type headers
-//
-// returns { changed(): (diff_function) => {...} }
-//     this is for outgoing changes;
-//     diff_function = () => ({patches, new_version}).
-//
 function simpleton_client(url, { apply_remote_update, generate_local_diff_update, content_type }) {
-    var peer = Math.random().toString(36).substr(2)
+    var peer = Math.random().toString(36).slice(2)
     var current_version = []
     var prev_state = ""
     var char_counter = -1
-    var outstanding_changes = 0
-    var max_outstanding_changes = 10
-    var ac = new AbortController()
 
     // Create a promise chain to serialize apply_remote_update calls
     let updateChain = Promise.resolve()
 
-    braid_fetch_wrapper(url, {
-        headers: {
-            "Merge-Type": "simpleton",
-            ...(content_type ? { Accept: content_type } : {})
-        },
-        subscribe: true,
-        retry: true,
-        parents: () => current_version.length ? current_version : null,
-        peer,
-        signal: ac.signal
-    }).then(res =>
-        res.subscribe(update => {
+    braid_text.get(url, {
+        subscribe: (update) => {
             // Add this update to the chain
             updateChain = updateChain.then(async () => {
                 // Only accept the update if its parents == our current version
@@ -374,15 +284,11 @@ function simpleton_client(url, { apply_remote_update, generate_local_diff_update
                     prev_state = await apply_remote_update(update)
                 }
             })
-        })
-    )
+        }
+    })
 
     return {
-        stop: async () => {
-            ac.abort()
-        },
         changed: async () => {
-            if (outstanding_changes >= max_outstanding_changes) return
             while (true) {
                 var update = await generate_local_diff_update(prev_state)
                 if (!update) return   // Stop if there wasn't a change!
@@ -417,19 +323,7 @@ function simpleton_client(url, { apply_remote_update, generate_local_diff_update
                 current_version = version
                 prev_state = new_state
 
-                outstanding_changes++
-                await braid_fetch_wrapper(url, {
-                    headers: {
-                        "Merge-Type": "simpleton",
-                        ...(cookie ? { "Cookie": cookie } : {}),
-                        ...(content_type ? { "Content-Type": content_type } : {})
-                    },
-                    method: "PUT",
-                    retry: true,
-                    version, parents, patches,
-                    peer
-                })
-                outstanding_changes--
+                braid_text.put(url, { version, parents, patches })
             }
         }
     }
@@ -466,7 +360,7 @@ async function braid_fetch_wrapper(url, params) {
             }
         }
         function on_error(e) {
-            console.log('eee = ' + e.stack)
+            console.log(`eee[url:${url}] = ` + e.stack)
             setTimeout(connect, waitTime)
             waitTime = Math.min(waitTime * 2, 3000)
         }
