@@ -86,6 +86,9 @@ pindex_urls.forEach(async url => {
         let urls = await (await fetch(url)).json()
         for (let url of urls) {
             proxy_url(prefix + url)
+
+            // work here
+            break
         }
         await new Promise(done => setTimeout(done, 1000 * 60 * 60))
     }
@@ -94,6 +97,11 @@ pindex_urls.forEach(async url => {
 ////////////////////////////////
 
 async function proxy_url(url) {
+    const parsedUrl = new URL(url)
+    // normalize url by removing any trailing /index.html/index.html/
+    parsedUrl.pathname = parsedUrl.pathname.replace(/(\/index\.html|\/)+$/, '')
+    url = parsedUrl.toString()
+
     if (!proxy_url.cache) proxy_url.cache = {}
     if (proxy_url.cache[url]) return
     proxy_url.cache[url] = true
@@ -102,6 +110,7 @@ async function proxy_url(url) {
 
     let peer = Math.random().toString(36).slice(2)
     let current_version = []
+    let chain = Promise.resolve()
 
     braid_fetch_wrapper(url, {
         headers: {
@@ -114,7 +123,7 @@ async function proxy_url(url) {
         peer
     }).then(x => {
         x.subscribe(update => {
-            console.log(`update: ${JSON.stringify(update, null, 4)}`)
+            // console.log(`update: ${JSON.stringify(update, null, 4)}`)
             if (update.version.length == 0) return;
 
             braid_text.put(url, { ...update, peer })
@@ -126,6 +135,7 @@ async function proxy_url(url) {
             if (version.length == 0) return;
 
             console.log(`local got: ${JSON.stringify({ version, parents, body, patches }, null, 4)}`)
+            console.log(`cookie = ${cookie}`)
 
             await braid_fetch_wrapper(url, {
                 headers: {
@@ -145,25 +155,69 @@ async function proxy_url(url) {
 
     let last_text = ''
     let path = url.replace(/^https?:\/\//, '')
+    let fullpath = require("path").join(proxy_base, path)
 
-    let fullpath = proxy_base + '/' + path
-    await require('fs').promises.mkdir(require('path').dirname(fullpath), { recursive: true })
+    // ensure that the path leading to our file exists..
+    await (chain = chain.then(async () => {
+        let path_dir = require("path").dirname(fullpath)
+        try {
+            await require("fs").promises.mkdir(path_dir, { recursive: true })
+        } catch (e) {
+            let parts = path.split(require("path").sep)
+            for (let i = 1; i <= parts.length; i++) {
+                let partial = require("path").join(...parts.slice(0, i))
+                let p = require("path").join(proxy_base, partial)
+
+                console.log(`p = ${p}`)
+
+                if (!(await is_dir(p))) {
+                    let save = await require("fs").promises.readFile(p)
+                    let func = proxy_url.path_to_func[partial]
+                    delete proxy_url.path_to_func[partial]
+
+                    await require("fs").promises.unlink(p)
+                    await require("fs").promises.mkdir(path_dir, { recursive: true })
+
+                    while (await is_dir(p)) {
+                        p = require("path").join(p, 'index.html')
+                        partial = require("path").join(partial, 'index.html')
+                    }
+
+                    await require("fs").promises.writeFile(p, save)
+                    proxy_url.path_to_func[partial] = func
+                    break
+                }
+            }
+        }
+    }))
+
+    async function get_fullpath() {
+        let p = fullpath
+
+        console.log(`p2 = ${p}`)
+
+        while (await is_dir(p)) p = require("path").join(p, 'index.html')
+        return p
+    }
 
     let simpleton = simpleton_client(url, {
         apply_remote_update: async ({ state, patches }) => {
+            return await (chain = chain.then(async () => {
+                console.log(`writing file ${await get_fullpath()}`)
 
-            console.log(`writing file ${fullpath}`)
-
-            if (state !== undefined) last_text = state
-            else last_text = apply_patches(last_text, patches)
-            await require('fs').promises.writeFile(fullpath, last_text)
-            return last_text
+                if (state !== undefined) last_text = state
+                else last_text = apply_patches(last_text, patches)
+                await require('fs').promises.writeFile(await get_fullpath(), last_text)
+                return last_text
+            }))
         },
         generate_local_diff_update: async (_) => {
-            let text = await require('fs').promises.readFile(fullpath, { encoding: 'utf8' })
-            var patches = diff(last_text, text)
-            last_text = text
-            return patches.length ? { patches, new_state: last_text } : null
+            return await (chain = chain.then(async () => {
+                let text = await require('fs').promises.readFile(await get_fullpath(), { encoding: 'utf8' })
+                var patches = diff(last_text, text)
+                last_text = text
+                return patches.length ? { patches, new_state: last_text } : null
+            }))
         }
     })
 
@@ -180,6 +234,12 @@ async function proxy_url(url) {
             proxy_url.path_to_func[path]()
         });
     }
+}
+
+async function is_dir(p) {
+    try {
+        return (await require("fs").promises.stat(p)).isDirectory()
+    } catch (e) { }
 }
 
 function diff(before, after) {
@@ -244,14 +304,13 @@ function simpleton_client(url, { apply_remote_update, generate_local_diff_update
     var current_version = []
     var prev_state = ""
     var char_counter = -1
-
-    // Create a promise chain to serialize apply_remote_update calls
-    let updateChain = Promise.resolve()
+    var chain = Promise.resolve()
+    var queued_changes = 0
 
     braid_text.get(url, {
+        peer,
         subscribe: (update) => {
-            // Add this update to the chain
-            updateChain = updateChain.then(async () => {
+            chain = chain.then(async () => {
                 // Only accept the update if its parents == our current version
                 update.parents.sort()
                 if (current_version.length === update.parents.length
@@ -262,6 +321,9 @@ function simpleton_client(url, { apply_remote_update, generate_local_diff_update
                     if (update.patches) {
                         for (let p of update.patches) p.range = p.range.match(/\d+/g).map((x) => 1 * x)
                         update.patches.sort((a, b) => a.range[0] - b.range[0])
+
+                        console.log('HERE:' + JSON.stringify({ patches: update.patches }, null, 4))
+                        console.log('current: ' + prev_state)
 
                         // convert from code-points to js-indicies
                         let c = 0
@@ -288,8 +350,11 @@ function simpleton_client(url, { apply_remote_update, generate_local_diff_update
     })
 
     return {
-        changed: async () => {
-            while (true) {
+        changed: () => {
+            if (queued_changes) return
+            queued_changes++
+            chain = chain.then(async () => {
+                queued_changes--
                 var update = await generate_local_diff_update(prev_state)
                 if (!update) return   // Stop if there wasn't a change!
                 var { patches, new_state } = update
@@ -323,8 +388,8 @@ function simpleton_client(url, { apply_remote_update, generate_local_diff_update
                 current_version = version
                 prev_state = new_state
 
-                braid_text.put(url, { version, parents, patches })
-            }
+                braid_text.put(url, { version, parents, patches, peer })
+            })
         }
     }
 }
