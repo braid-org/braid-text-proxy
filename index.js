@@ -86,9 +86,6 @@ pindex_urls.forEach(async url => {
         let urls = await (await fetch(url)).json()
         for (let url of urls) {
             proxy_url(prefix + url)
-
-            // work here
-            break
         }
         await new Promise(done => setTimeout(done, 1000 * 60 * 60))
     }
@@ -134,8 +131,8 @@ async function proxy_url(url) {
         subscribe: async ({ version, parents, body, patches }) => {
             if (version.length == 0) return;
 
-            console.log(`local got: ${JSON.stringify({ version, parents, body, patches }, null, 4)}`)
-            console.log(`cookie = ${cookie}`)
+            // console.log(`local got: ${JSON.stringify({ version, parents, body, patches }, null, 4)}`)
+            // console.log(`cookie = ${cookie}`)
 
             await braid_fetch_wrapper(url, {
                 headers: {
@@ -168,7 +165,7 @@ async function proxy_url(url) {
                 let partial = require("path").join(...parts.slice(0, i))
                 let p = require("path").join(proxy_base, partial)
 
-                console.log(`p = ${p}`)
+                // console.log(`p = ${p}`)
 
                 if (!(await is_dir(p))) {
                     let save = await require("fs").promises.readFile(p)
@@ -193,9 +190,6 @@ async function proxy_url(url) {
 
     async function get_fullpath() {
         let p = fullpath
-
-        console.log(`p2 = ${p}`)
-
         while (await is_dir(p)) p = require("path").join(p, 'index.html')
         return p
     }
@@ -321,9 +315,6 @@ function simpleton_client(url, { apply_remote_update, generate_local_diff_update
                     if (update.patches) {
                         for (let p of update.patches) p.range = p.range.match(/\d+/g).map((x) => 1 * x)
                         update.patches.sort((a, b) => a.range[0] - b.range[0])
-
-                        console.log('HERE:' + JSON.stringify({ patches: update.patches }, null, 4))
-                        console.log('current: ' + prev_state)
 
                         // convert from code-points to js-indicies
                         let c = 0
