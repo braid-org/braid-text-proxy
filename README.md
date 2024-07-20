@@ -1,3 +1,5 @@
+# NOTE: This project has moved to [braid-proxy](https://github.com/braid-org/braid-proxy)
+
 # braid-text-proxy
 A proxy exposing and caching web and file resources over a convenient protocol.
 
